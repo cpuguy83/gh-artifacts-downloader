@@ -29,7 +29,7 @@ func main() {
 		pattern      = os.Getenv("ARTIFACT_PATTERN")
 		level        = "debug"
 		unpack       = true
-		output       = ""
+		output       = os.Getenv("ARTIFACT_OUTPUT")
 		repo         = os.Getenv("GITHUB_REPO")
 		workflowIDFl = os.Getenv("GITHUB_WORKFLOW_ID")
 	)
@@ -41,7 +41,7 @@ func main() {
 	flag.StringVar(&pattern, "pattern", pattern, "regexp pattern to match for artifacts")
 	flag.StringVar(&level, "log-level", level, "log level")
 	flag.BoolVar(&unpack, "unpack", unpack, "Unpack artifacts")
-	flag.StringVar(&output, "output", output, "dir to output artifacts to")
+	flag.StringVar(&output, "output", output, "Directory to output artifacts to. This can also be set by the ARTIFACT_OUTPUT environment variable.")
 	flag.StringVar(&repo, "repo", repo, "The repo where artifacts are stored. Use the form <org>/<repository>. This can also be set by the GITHUB_REPO environment variable.")
 	flag.StringVar(&workflowIDFl, "id", workflowIDFl, "ID of the workflow you want to get artifacts from. This can also be set by the GITHUB_WORKFLOW_ID environment variable.")
 
