@@ -1,4 +1,4 @@
-module gh-artifacts-downloader
+module github.com/cpuguy83/gh-artifacts-downloader
 
 go 1.15
 
