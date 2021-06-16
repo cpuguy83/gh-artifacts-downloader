@@ -1,14 +1,12 @@
 package main
 
 import (
-	"archive/zip"
 	"context"
-	"encoding/json"
 	"flag"
 	"fmt"
-	"io"
 	"net/http"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"regexp"
 	"strconv"
@@ -20,18 +18,38 @@ import (
 )
 
 var (
-	token = os.Getenv("GITHUB_TOKEN")
-	user  = os.Getenv("GITHUB_USER")
+	token  = os.Getenv("GITHUB_TOKEN")
+	user   = os.Getenv("GITHUB_USER")
+	output = os.Getenv("ARTIFACT_OUTPUT")
+
+	unpack  = true
+	matcher *regexp.Regexp
+
+	org  string
+	repo string
 )
+
+func cancelOnSig(ctx context.Context) context.Context {
+	ch := make(chan os.Signal, 1)
+	signal.Notify(ch, signals()...)
+
+	ctx, cancel := context.WithCancel(ctx)
+	go func() {
+		<-ch
+		cancel()
+	}()
+	return ctx
+}
 
 func main() {
 	var (
-		pattern      = os.Getenv("ARTIFACT_PATTERN")
-		level        = "debug"
-		unpack       = true
-		output       = os.Getenv("ARTIFACT_OUTPUT")
-		repo         = os.Getenv("GITHUB_REPO")
-		workflowIDFl = os.Getenv("GITHUB_WORKFLOW_ID")
+		pattern        = os.Getenv("ARTIFACT_PATTERN")
+		level          = "error"
+		workflowIDFl   = os.Getenv("GITHUB_WORKFLOW_ID")
+		branchFilter   = os.Getenv("WORKFLOW_BRANCH_FILTER")
+		eventFilter    = os.Getenv("WORKFLOW_EVENT_FILTER")
+		orgRepo        = os.Getenv("GITHUB_REPO")
+		singleArtifact = false
 	)
 
 	if pattern == "" {
@@ -42,15 +60,22 @@ func main() {
 	flag.StringVar(&level, "log-level", level, "log level")
 	flag.BoolVar(&unpack, "unpack", unpack, "Unpack artifacts")
 	flag.StringVar(&output, "output", output, "Directory to output artifacts to. This can also be set by the ARTIFACT_OUTPUT environment variable.")
-	flag.StringVar(&repo, "repo", repo, "The repo where artifacts are stored. Use the form <org>/<repository>. This can also be set by the GITHUB_REPO environment variable.")
-	flag.StringVar(&workflowIDFl, "id", workflowIDFl, "ID of the workflow you want to get artifacts from. This can also be set by the GITHUB_WORKFLOW_ID environment variable.")
+	flag.StringVar(&orgRepo, "repo", orgRepo, "The repo where artifacts are stored. Use the form <org>/<repository>. This can also be set by the GITHUB_REPO environment variable.")
+	flag.StringVar(&workflowIDFl, "id", workflowIDFl, "ID of the last workflow run to get. This can also be set by the GITHUB_WORKFLOW_ID environment variable.")
+	flag.StringVar(&branchFilter, "branch-filter", branchFilter, "Filter workflow runs based on branch where the workflow was triggered")
+	flag.StringVar(&eventFilter, "event-filter", eventFilter, "Filter workflow runs based on the event that triggered the run")
+	flag.BoolVar(&singleArtifact, "single", singleArtifact, "Only download from the workflow run id specified instead of all runs newer than it")
 
 	flag.Parse()
 
 	lvl, err := logrus.ParseLevel(level)
+	logrus.SetOutput(os.Stderr)
 	errorOut(err, 1)
 
-	if repo == "" {
+	if output == "" {
+		errorOut(errors.New("must set an output dir"), 1)
+	}
+	if orgRepo == "" {
 		errorOut(errors.New("must set repo flag"), 1)
 	}
 
@@ -60,180 +85,100 @@ func main() {
 	logrus.SetLevel(lvl)
 	logrus.SetOutput(os.Stderr)
 
-	matcher := regexp.MustCompile(pattern)
+	matcher = regexp.MustCompile(pattern)
 
-	gh := github.NewClient(&http.Client{
+	httpClient := &http.Client{
 		Transport: &basicAuthRT{http.DefaultTransport},
-	})
-
-	ctx := context.TODO()
-
-	repoSplit := strings.SplitN(repo, "/", 2)
-	w, ghResp, err := gh.Actions.GetWorkflowRunByID(ctx, repoSplit[0], repoSplit[1], int64(wfid))
-	errorOut(err, 1)
-
-	ghResp.Body.Close()
-
-	resp, err := http.Get(w.GetArtifactsURL())
-	if err != nil {
-		errorOut(err, 2)
 	}
-	defer resp.Body.Close()
+	gh := github.NewClient(httpClient)
 
-	type al struct {
-		Artifacts []artifact `json:"artifacts"`
-	}
+	ctx := cancelOnSig(context.Background())
 
-	var ls al
-	if err := json.NewDecoder(resp.Body).Decode(&ls); err != nil {
-		errorOut(err, 2)
-	}
+	repoSplit := strings.SplitN(orgRepo, "/", 2)
+	org = repoSplit[0]
+	repo = repoSplit[1]
 
-	for _, a := range ls.Artifacts {
-		if a.Expired {
-			logrus.Debugf("Skipping expired artifact %s", a.Name)
-			continue
-		}
-
-		if !matcher.MatchString(a.Name) {
-			logrus.Debugf("Skipping non-matching artifact %s, pattern %s", a.Name, pattern)
-			continue
-		}
-
-		if output == "" {
-			fmt.Println(a.URL)
-			continue
-		}
-
-		a.org = repoSplit[0]
-		a.repo = repoSplit[1]
-
-		if err := getArtifact(ctx, gh, a, output, unpack); err != nil {
+	if singleArtifact {
+		// TODO
+		run, resp, err := gh.Actions.GetWorkflowRunByID(ctx, org, repo, int64(wfid))
+		if err != nil {
 			errorOut(err, 2)
 		}
-	}
-}
+		defer resp.Body.Close()
+		errorOut(checkResponseErr(resp), 2)
 
-type artifact struct {
-	ID      int64  `json:"id"`
-	URL     string `json:"archive_download_url"`
-	Expired bool   `json:"expired"`
-	Name    string `json:"name"`
-	Size    int64  `json:"size_in_bytes"`
-	org     string
-	repo    string
-}
-
-func getArtifact(ctx context.Context, client *github.Client, a artifact, dir string, unpack bool) error {
-	u, resp, err := client.Actions.DownloadArtifact(ctx, a.org, a.repo, a.ID, false)
-	if err != nil {
-		logrus.Debugf("org: %s, repo: %s, id: %d", a.org, a.repo, a.ID)
-		type ghErr struct {
-			Message string `json:"message"`
-		}
-		e := &ghErr{}
-		json.NewDecoder(io.LimitReader(resp.Body, 32*1024)).Decode(e)
-		return errors.Wrapf(err, "error getting url to download artifact: %s", e.Message)
-	}
-	resp.Body.Close()
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
-	if err != nil {
-		return err
+		err = getWorkflowRunArtifacts(ctx, gh, run, output)
+		errorOut(err, 2)
+		return
 	}
 
-	if err := os.MkdirAll(dir, 0700); err != nil {
-		return errors.Wrap(err, "error creating artifact dir")
-	}
-
-	f, err := os.OpenFile(filepath.Join(dir, a.Name)+".zip", os.O_CREATE|os.O_RDWR|os.O_TRUNC, 0600)
-	if err != nil {
-		return errors.Wrap(err, "error creating save file")
-	}
-	defer f.Close()
-
-	resp, err = client.Do(ctx, req, f)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-
-	if !unpack {
-		return nil
-	}
-
-	// Seek here because I've found the size reported by github to be unreliable.
-	pos, err := f.Seek(0, io.SeekCurrent)
-	if err != nil {
-		return errors.Wrap(err, "error getting artifact size")
-	}
-
-	r, err := zip.NewReader(f, pos)
-	if err != nil {
-		return errors.Wrapf(err, "error making zip reader from file %s", f.Name())
-	}
-	if err := unzip(r, a, dir); err != nil {
-		return err
-	}
-
-	f.Close()
-	if err := os.Remove(f.Name()); err != nil && !os.IsNotExist(err) {
-		return err
-	}
-
-	return nil
-}
-
-var _ http.RoundTripper = basicAuthRT{}
-
-type basicAuthRT struct {
-	rt http.RoundTripper
-}
-
-func (t basicAuthRT) RoundTrip(req *http.Request) (*http.Response, error) {
-	req = req.Clone(req.Context())
-	req.SetBasicAuth(user, token)
-	return t.rt.RoundTrip(req)
-}
-
-func unzip(r *zip.Reader, a artifact, dest string) error {
-	for _, zf := range r.File {
+	var (
+		page  int
+		count int
+		total int
+		maxID int64
+	)
+	defer func() {
+		fmt.Println(maxID)
+	}()
+	for {
 		err := func() error {
-			rc, err := zf.Open()
+			if total > 0 && count >= total {
+				return fmt.Errorf("%w: ", errDone)
+			}
+			runs, resp, err := gh.Actions.ListRepositoryWorkflowRuns(ctx, org, repo, &github.ListWorkflowRunsOptions{
+				Branch: branchFilter,
+				Event:  eventFilter,
+				ListOptions: github.ListOptions{
+					PerPage: 50,
+					Page:    page,
+				},
+			})
 			if err != nil {
-				return errors.Wrap(err, "error opening file in zip")
+				return err
 			}
-			defer rc.Close()
-
-			if zf.Mode().IsDir() {
-				if err := os.MkdirAll(filepath.Join(dest, a.Name, zf.Name), 0755); err != nil {
-					return err
-				}
-			} else {
-				if parent := filepath.Dir(filepath.Join(dest, a.Name, zf.Name)); parent != "" {
-					if err := os.MkdirAll(parent, 0755); err != nil {
-						return errors.Wrap(err, "error creating parent dir for file in zip")
-					}
-				}
-
-				f, err := os.OpenFile(filepath.Join(dest, a.Name, zf.Name), os.O_WRONLY|os.O_CREATE|os.O_TRUNC, zf.Mode().Perm())
-				if err != nil {
-					return errors.Wrap(err, "error creating file for unpacked result")
-				}
-				defer f.Close()
-				if _, err := io.Copy(f, rc); err != nil {
-					return err
-				}
+			if err := checkResponseErr(resp); err != nil {
+				return err
 			}
 
+			defer resp.Body.Close()
+
+			count += len(runs.WorkflowRuns)
+			total = runs.GetTotalCount()
+
+			logger(ctx).WithField("page", page).WithField("runs", len(runs.WorkflowRuns)).Debug("Got workflow run batch")
+			page = resp.NextPage
+
+			for _, run := range runs.WorkflowRuns {
+				if run.GetID() <= int64(wfid) {
+					return fmt.Errorf("%w: reached last workflow run id", errDone)
+				}
+
+				if run.GetID() > maxID {
+					maxID = run.GetID()
+				}
+
+				ctx := withLogger(ctx, logrus.WithField("id", run.GetID()))
+				if err := getWorkflowRunArtifacts(ctx, gh, run, filepath.Join(output, strconv.Itoa(int(run.GetID())))); err != nil {
+					return err
+				}
+			}
+
+			page++
 			return nil
 		}()
 		if err != nil {
-			return err
+			if !errors.Is(err, errDone) {
+				errorOut(err, 2)
+			}
+			logrus.Debug(err)
+			break
 		}
 	}
-	return nil
+
 }
+
+var errDone = fmt.Errorf("done")
 
 func errorOut(err error, code int) {
 	if err == nil {
