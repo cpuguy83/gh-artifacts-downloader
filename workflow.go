@@ -3,7 +3,9 @@ package main
 import (
 	"context"
 	"fmt"
+	"io/ioutil"
 	"net/http"
+	"path/filepath"
 	"time"
 
 	"github.com/google/go-github/v34/github"
@@ -16,7 +18,7 @@ func getWorkflowRunArtifacts(ctx context.Context, gh *github.Client, run *github
 		return err
 	}
 
-	var ls artifactList
+	var ls github.ArtifactList
 	reqCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	resp, err := gh.Do(reqCtx, req, &ls)
 	cancel()
@@ -33,15 +35,19 @@ func getWorkflowRunArtifacts(ctx context.Context, gh *github.Client, run *github
 	logger(ctx).WithField("numArtfacts", len(ls.Artifacts)).Debug("Got artifact list")
 
 	for _, a := range ls.Artifacts {
-		if a.Expired {
+		if a.GetExpired() {
 			logrus.Debugf("Skipping expired artifact %s", a.Name)
 			continue
 		}
 
-		if !matcher.MatchString(a.Name) {
+		if !matcher.MatchString(a.GetName()) {
 			logrus.Debugf("Skipping non-matching artifact %s", a.Name)
 			continue
 		}
+
+		ioutil.WriteFile(filepath.Join(output, "commit"), []byte(run.GetHeadCommit().GetID()), 0600)
+		ioutil.WriteFile(filepath.Join(output, "event"), []byte(run.GetEvent()), 0600)
+		ioutil.WriteFile(filepath.Join(output, "message"), []byte(run.GetHeadCommit().GetMessage()), 0600)
 
 		if err := getArtifact(ctx, gh, a, output, unpack); err != nil {
 			return err

@@ -12,27 +12,12 @@ import (
 
 	"github.com/google/go-github/v34/github"
 	"github.com/pkg/errors"
-	"github.com/sirupsen/logrus"
 )
 
-type artifactList struct {
-	Artifacts []artifact `json:"artifacts"`
-}
-
-type artifact struct {
-	ID      int64  `json:"id"`
-	URL     string `json:"archive_download_url"`
-	Expired bool   `json:"expired"`
-	Name    string `json:"name"`
-	Size    int64  `json:"size_in_bytes"`
-	org     string
-	repo    string
-}
-
-func getArtifact(ctx context.Context, client *github.Client, a artifact, dir string, unpack bool) error {
-	u, resp, err := client.Actions.DownloadArtifact(ctx, org, repo, a.ID, false)
+func getArtifact(ctx context.Context, client *github.Client, a *github.Artifact, dir string, unpack bool) error {
+	u, resp, err := client.Actions.DownloadArtifact(ctx, org, repo, a.GetID(), false)
 	if err != nil {
-		logrus.Debugf("org: %s, repo: %s, id: %d", org, repo, a.ID)
+		logger(ctx).Debugf("org: %s, repo: %s, id: %d", org, repo, a.GetID())
 
 		e := &ghErr{}
 		if resp != nil {
@@ -51,7 +36,7 @@ func getArtifact(ctx context.Context, client *github.Client, a artifact, dir str
 		return errors.Wrap(err, "error creating artifact dir")
 	}
 
-	f, err := os.OpenFile(filepath.Join(dir, a.Name)+".zip", os.O_CREATE|os.O_RDWR|os.O_TRUNC, 0600)
+	f, err := os.OpenFile(filepath.Join(dir, a.GetName())+".zip", os.O_CREATE|os.O_RDWR|os.O_TRUNC, 0600)
 	if err != nil {
 		return errors.Wrap(err, "error creating save file")
 	}
@@ -62,6 +47,10 @@ func getArtifact(ctx context.Context, client *github.Client, a artifact, dir str
 		return err
 	}
 	defer resp.Body.Close()
+
+	if err := checkResponseErr(resp); err != nil {
+		return err
+	}
 
 	if !unpack {
 		return nil
@@ -89,7 +78,7 @@ func getArtifact(ctx context.Context, client *github.Client, a artifact, dir str
 	return nil
 }
 
-func unzip(r *zip.Reader, a artifact, dest string) error {
+func unzip(r *zip.Reader, a *github.Artifact, dest string) error {
 	for _, zf := range r.File {
 		err := func() error {
 			rc, err := zf.Open()
@@ -99,17 +88,17 @@ func unzip(r *zip.Reader, a artifact, dest string) error {
 			defer rc.Close()
 
 			if zf.Mode().IsDir() {
-				if err := os.MkdirAll(filepath.Join(dest, a.Name, zf.Name), 0755); err != nil {
+				if err := os.MkdirAll(filepath.Join(dest, a.GetName(), zf.Name), 0755); err != nil {
 					return err
 				}
 			} else {
-				if parent := filepath.Dir(filepath.Join(dest, a.Name, zf.Name)); parent != "" {
+				if parent := filepath.Dir(filepath.Join(dest, a.GetName(), zf.Name)); parent != "" {
 					if err := os.MkdirAll(parent, 0755); err != nil {
 						return errors.Wrap(err, "error creating parent dir for file in zip")
 					}
 				}
 
-				f, err := os.OpenFile(filepath.Join(dest, a.Name, zf.Name), os.O_WRONLY|os.O_CREATE|os.O_TRUNC, zf.Mode().Perm())
+				f, err := os.OpenFile(filepath.Join(dest, a.GetName(), zf.Name), os.O_WRONLY|os.O_CREATE|os.O_TRUNC, zf.Mode().Perm())
 				if err != nil {
 					return errors.Wrap(err, "error creating file for unpacked result")
 				}
